@@ -1,0 +1,9 @@
+*.iml
+.DS_Store
+.gradle/
+.idea/
+local.properties
+build/
+captures/
+app/build/
+host/__pycache__/
