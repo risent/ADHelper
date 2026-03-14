@@ -58,6 +58,11 @@ class HelperAccessibilityService : AccessibilityService() {
         val swipeEndY: Float,
     )
 
+    private data class ClickableSnapshot(
+        val packageName: String?,
+        val clickables: JSONArray,
+    )
+
     private data class ScreenshotPayload(
         val base64: String,
         val mimeType: String,
@@ -203,6 +208,9 @@ class HelperAccessibilityService : AccessibilityService() {
 
         val result = when (command) {
             "dump_tree" -> dumpTree()
+            "list_clickables" -> listClickables(
+                visibleOnly = request.optBoolean("visibleOnly", true),
+            )
             "click_text" -> clickText(
                 text = request.optString("text").trim(),
                 exact = request.optBoolean("exact", false),
@@ -218,6 +226,7 @@ class HelperAccessibilityService : AccessibilityService() {
                 distanceRatio = request.optDoubleOrDefault("distanceRatio", 0.55).coerceIn(0.2, 0.85),
             )
 
+            "back" -> goBack()
             "screenshot" -> screenshot()
             else -> throw IllegalArgumentException("Unknown command: $command")
         }
@@ -239,6 +248,17 @@ class HelperAccessibilityService : AccessibilityService() {
             .put("nodeCount", snapshot.nodeCount)
             .put("truncated", snapshot.truncated)
             .put("tree", snapshot.rootJson)
+    }
+
+    private fun listClickables(visibleOnly: Boolean): JSONObject {
+        val snapshot = withActiveRoot { root ->
+            captureClickables(root, visibleOnly)
+        }
+
+        return JSONObject()
+            .put("packageName", snapshot.packageName)
+            .put("count", snapshot.clickables.length())
+            .put("clickables", snapshot.clickables)
     }
 
     private fun clickText(
@@ -371,6 +391,13 @@ class HelperAccessibilityService : AccessibilityService() {
             .put("endY", plan.swipeEndY)
     }
 
+    private fun goBack(): JSONObject {
+        val success = performGlobalAction(GLOBAL_ACTION_BACK)
+        return JSONObject()
+            .put("handled", success)
+            .put("performed", success)
+    }
+
     private fun screenshot(): JSONObject {
         val payload = takeScreenshotPayload()
         return JSONObject()
@@ -388,6 +415,18 @@ class HelperAccessibilityService : AccessibilityService() {
             nodeCount = state.nodeCount,
             truncated = state.truncated,
             packageName = root.packageName?.toString(),
+        )
+    }
+
+    private fun captureClickables(
+        root: AccessibilityNodeInfo,
+        visibleOnly: Boolean,
+    ): ClickableSnapshot {
+        val clickables = JSONArray()
+        collectClickables(root, mutableListOf(), clickables, visibleOnly)
+        return ClickableSnapshot(
+            packageName = root.packageName?.toString(),
+            clickables = clickables,
         )
     }
 
@@ -435,6 +474,32 @@ class HelperAccessibilityService : AccessibilityService() {
                 .put("top", bounds.top)
                 .put("right", bounds.right)
                 .put("bottom", bounds.bottom))
+    }
+
+    private fun collectClickables(
+        node: AccessibilityNodeInfo,
+        path: MutableList<Int>,
+        output: JSONArray,
+        visibleOnly: Boolean,
+    ) {
+        if ((!visibleOnly || node.isVisibleToUser) && (node.isClickable || node.isFocusable)) {
+            val bounds = Rect().also { node.getBoundsInScreen(it) }
+            if (!bounds.isEmpty) {
+                output.put(
+                    buildNodeSummary(node)
+                        .put("path", JSONArray(path))
+                        .put("centerX", bounds.centerX())
+                        .put("centerY", bounds.centerY()),
+                )
+            }
+        }
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            path.add(index)
+            collectClickables(child, path, output, visibleOnly)
+            path.removeAt(path.lastIndex)
+        }
     }
 
     private fun findMatchingNode(
@@ -655,14 +720,20 @@ class HelperAccessibilityService : AccessibilityService() {
     }
 
     private fun <T> withActiveRoot(block: (AccessibilityNodeInfo) -> T): T {
-        return runOnMainThread {
-            val root = rootInActiveWindow ?: throw IllegalStateException("No active window")
+        val root = runOnMainThread {
+            val activeRoot = rootInActiveWindow ?: throw IllegalStateException("No active window")
+            AccessibilityNodeInfo.obtain(activeRoot)
+        }
+
+        return try {
             block(root)
+        } finally {
+            root.recycle()
         }
     }
 
     private fun <T> runOnMainThread(
-        timeoutMs: Long = 4000L,
+        timeoutMs: Long = 12000L,
         block: () -> T,
     ): T {
         if (Looper.myLooper() == Looper.getMainLooper()) {

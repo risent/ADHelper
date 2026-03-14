@@ -10,9 +10,11 @@
 ## Android 端能力
 
 - `dump_tree`: 读取当前界面节点树并返回 JSON。
+- `list_clickables`: 列出当前界面所有可点击或可聚焦节点，便于电脑端做遍历。
 - `click_text`: 按文本、内容描述或 view id 查找第一个匹配节点并点击。
 - `click_point`: 按屏幕坐标点击。
 - `scroll`: 优先走无障碍滚动动作，失败时退回手势滑动。
+- `back`: 执行 Android 全局返回。
 - `screenshot`: 截图并把 JPEG 的 base64 数据放进响应。
 
 当前实现基于 Android 11 以上的 `AccessibilityService.takeScreenshot`，所以 `minSdk` 设为 `30`。
@@ -57,6 +59,12 @@ python3 host/helper_client.py --pretty health
 python3 host/helper_client.py --pretty dump-tree --output tree.json
 ```
 
+导出当前页可点击节点：
+
+```bash
+python3 host/helper_client.py --pretty list-clickables --output clickables.json
+```
+
 按文本点击：
 
 ```bash
@@ -75,6 +83,12 @@ python3 host/helper_client.py --pretty click-point 540 1600
 ```bash
 python3 host/helper_client.py --pretty scroll down
 python3 host/helper_client.py --pretty scroll up --distance-ratio 0.7
+```
+
+返回上一页：
+
+```bash
+python3 host/helper_client.py --pretty back
 ```
 
 截图：
@@ -113,7 +127,15 @@ Content-Type: application/json
 ```
 
 ```json
+{"command":"back"}
+```
+
+```json
 {"command":"dump_tree"}
+```
+
+```json
+{"command":"list_clickables"}
 ```
 
 ```json

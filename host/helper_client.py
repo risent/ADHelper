@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -78,6 +79,10 @@ class HelperClient:
                 "Unable to reach helper app. Is the app installed, the accessibility service enabled, "
                 "and adb forward configured?"
             ) from exc
+        except TimeoutError as exc:
+            raise HelperClientError("Timed out while waiting for helper app response") from exc
+        except socket.timeout as exc:
+            raise HelperClientError("Timed out while waiting for helper app response") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
     dump_tree = subparsers.add_parser("dump-tree", help="Fetch the current accessibility tree")
     dump_tree.add_argument("--output", type=Path, help="Write the JSON tree to a file")
 
+    list_clickables = subparsers.add_parser(
+        "list-clickables",
+        help="List clickable or focusable nodes on the current screen",
+    )
+    list_clickables.add_argument("--output", type=Path, help="Write the clickable-node JSON to a file")
+
     click_text = subparsers.add_parser("click-text", help="Click the first node matching text")
     click_text.add_argument("text", help="Text or content description to match")
     click_text.add_argument(
@@ -124,6 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.55,
         help="Gesture travel ratio between 0.2 and 0.85",
     )
+
+    subparsers.add_parser("back", help="Trigger Android global back action")
 
     screenshot = subparsers.add_parser("screenshot", help="Capture a screenshot")
     screenshot.add_argument(
@@ -170,6 +183,15 @@ def main() -> int:
                 print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
+        if args.command_name == "list-clickables":
+            response = client.command({"command": "list_clickables"})
+            if args.output:
+                write_json(args.output, response)
+                print(f"Wrote clickable-node JSON to {args.output}")
+            else:
+                print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
         if args.command_name == "click-text":
             response = client.command(
                 {
@@ -200,6 +222,11 @@ def main() -> int:
                     "distanceRatio": args.distance_ratio,
                 }
             )
+            print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
+        if args.command_name == "back":
+            response = client.command({"command": "back"})
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
