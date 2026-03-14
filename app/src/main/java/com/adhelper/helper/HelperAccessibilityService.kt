@@ -21,6 +21,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -61,6 +62,13 @@ class HelperAccessibilityService : AccessibilityService() {
     private data class ClickableSnapshot(
         val packageName: String?,
         val clickables: JSONArray,
+    )
+
+    private data class SnapshotPayload(
+        val packageName: String?,
+        val treeSnapshot: TreeSnapshot,
+        val clickableSnapshot: ClickableSnapshot,
+        val fingerprint: String,
     )
 
     private data class ScreenshotPayload(
@@ -207,13 +215,21 @@ class HelperAccessibilityService : AccessibilityService() {
         }
 
         val result = when (command) {
+            "current_app" -> currentApp()
             "dump_tree" -> dumpTree()
+            "snapshot" -> snapshot(
+                visibleOnly = request.optBoolean("visibleOnly", true),
+                includeScreenshot = request.optBoolean("includeScreenshot", false),
+            )
             "list_clickables" -> listClickables(
                 visibleOnly = request.optBoolean("visibleOnly", true),
             )
             "click_text" -> clickText(
                 text = request.optString("text").trim(),
                 exact = request.optBoolean("exact", false),
+            )
+            "click_node" -> clickNode(
+                nodeId = request.optString("nodeId").trim(),
             )
 
             "click_point" -> clickPoint(
@@ -227,6 +243,12 @@ class HelperAccessibilityService : AccessibilityService() {
             )
 
             "back" -> goBack()
+            "wait_for_stable_tree" -> waitForStableTree(
+                timeoutMs = request.optLongOrDefault("timeoutMs", 10_000L).coerceIn(500L, 60_000L),
+                pollIntervalMs = request.optLongOrDefault("pollIntervalMs", 500L).coerceIn(100L, 5_000L),
+                stableSamples = request.optIntOrDefault("stableSamples", 2).coerceIn(1, 5),
+                visibleOnly = request.optBoolean("visibleOnly", true),
+            )
             "screenshot" -> screenshot()
             else -> throw IllegalArgumentException("Unknown command: $command")
         }
@@ -250,6 +272,39 @@ class HelperAccessibilityService : AccessibilityService() {
             .put("tree", snapshot.rootJson)
     }
 
+    private fun currentApp(): JSONObject {
+        val packageName = withActiveRoot { root ->
+            root.packageName?.toString()
+        }
+
+        return JSONObject()
+            .put("packageName", packageName)
+            .put("helperPackageName", this.packageName)
+    }
+
+    private fun snapshot(
+        visibleOnly: Boolean,
+        includeScreenshot: Boolean,
+    ): JSONObject {
+        val payload = withActiveRoot { root ->
+            buildSnapshot(root, visibleOnly)
+        }
+
+        return JSONObject()
+            .put("packageName", payload.packageName)
+            .put("nodeCount", payload.treeSnapshot.nodeCount)
+            .put("truncated", payload.treeSnapshot.truncated)
+            .put("tree", payload.treeSnapshot.rootJson)
+            .put("clickableCount", payload.clickableSnapshot.clickables.length())
+            .put("clickables", payload.clickableSnapshot.clickables)
+            .put("fingerprint", payload.fingerprint)
+            .apply {
+                if (includeScreenshot) {
+                    put("screenshot", screenshot())
+                }
+            }
+    }
+
     private fun listClickables(visibleOnly: Boolean): JSONObject {
         val snapshot = withActiveRoot { root ->
             captureClickables(root, visibleOnly)
@@ -259,6 +314,42 @@ class HelperAccessibilityService : AccessibilityService() {
             .put("packageName", snapshot.packageName)
             .put("count", snapshot.clickables.length())
             .put("clickables", snapshot.clickables)
+    }
+
+    private fun clickNode(nodeId: String): JSONObject {
+        if (nodeId.isBlank()) {
+            throw IllegalArgumentException("nodeId is required")
+        }
+
+        val clickPlan = withActiveRoot { root ->
+            val matchedNode = findNodeById(root, nodeId)
+                ?: throw IllegalArgumentException("No node matched nodeId: $nodeId")
+            val bounds = Rect().also { matchedNode.getBoundsInScreen(it) }
+            ClickPlan(
+                matchedNode = buildNodeSummary(matchedNode).put("nodeId", nodeId),
+                actionClickSucceeded = tryPerformNodeClick(matchedNode),
+                tapX = bounds.centerX(),
+                tapY = bounds.centerY(),
+            )
+        }
+
+        val clickMethod: String
+        val clickSucceeded: Boolean
+
+        if (clickPlan.actionClickSucceeded) {
+            clickMethod = "accessibility_action"
+            clickSucceeded = true
+        } else {
+            clickMethod = "gesture_tap"
+            clickSucceeded = dispatchTap(clickPlan.tapX.toFloat(), clickPlan.tapY.toFloat())
+        }
+
+        return JSONObject()
+            .put("matchedNode", clickPlan.matchedNode)
+            .put("clickMethod", clickMethod)
+            .put("clicked", clickSucceeded)
+            .put("tapX", clickPlan.tapX)
+            .put("tapY", clickPlan.tapY)
     }
 
     private fun clickText(
@@ -398,6 +489,51 @@ class HelperAccessibilityService : AccessibilityService() {
             .put("performed", success)
     }
 
+    private fun waitForStableTree(
+        timeoutMs: Long,
+        pollIntervalMs: Long,
+        stableSamples: Int,
+        visibleOnly: Boolean,
+    ): JSONObject {
+        val startedAt = System.currentTimeMillis()
+        var previousFingerprint: String? = null
+        var stableCount = 0
+        var lastPayload: SnapshotPayload? = null
+
+        while (System.currentTimeMillis() - startedAt <= timeoutMs) {
+            val payload = withActiveRoot { root ->
+                buildSnapshot(root, visibleOnly)
+            }
+            lastPayload = payload
+
+            if (payload.fingerprint == previousFingerprint) {
+                stableCount += 1
+            } else {
+                previousFingerprint = payload.fingerprint
+                stableCount = 1
+            }
+
+            if (stableCount >= stableSamples) {
+                return JSONObject()
+                    .put("stable", true)
+                    .put("packageName", payload.packageName)
+                    .put("fingerprint", payload.fingerprint)
+                    .put("stableSamplesObserved", stableCount)
+                    .put("elapsedMs", System.currentTimeMillis() - startedAt)
+            }
+
+            Thread.sleep(pollIntervalMs)
+        }
+
+        val payload = lastPayload
+        return JSONObject()
+            .put("stable", false)
+            .put("packageName", payload?.packageName)
+            .put("fingerprint", payload?.fingerprint)
+            .put("stableSamplesObserved", stableCount)
+            .put("elapsedMs", System.currentTimeMillis() - startedAt)
+    }
+
     private fun screenshot(): JSONObject {
         val payload = takeScreenshotPayload()
         return JSONObject()
@@ -427,6 +563,21 @@ class HelperAccessibilityService : AccessibilityService() {
         return ClickableSnapshot(
             packageName = root.packageName?.toString(),
             clickables = clickables,
+        )
+    }
+
+    private fun buildSnapshot(
+        root: AccessibilityNodeInfo,
+        visibleOnly: Boolean,
+    ): SnapshotPayload {
+        val treeSnapshot = captureTree(root)
+        val clickableSnapshot = captureClickables(root, visibleOnly)
+        val fingerprint = buildFingerprint(treeSnapshot, clickableSnapshot)
+        return SnapshotPayload(
+            packageName = root.packageName?.toString(),
+            treeSnapshot = treeSnapshot,
+            clickableSnapshot = clickableSnapshot,
+            fingerprint = fingerprint,
         )
     }
 
@@ -487,6 +638,7 @@ class HelperAccessibilityService : AccessibilityService() {
             if (!bounds.isEmpty) {
                 output.put(
                     buildNodeSummary(node)
+                        .put("nodeId", pathToNodeId(path))
                         .put("path", JSONArray(path))
                         .put("centerX", bounds.centerX())
                         .put("centerY", bounds.centerY()),
@@ -500,6 +652,49 @@ class HelperAccessibilityService : AccessibilityService() {
             collectClickables(child, path, output, visibleOnly)
             path.removeAt(path.lastIndex)
         }
+    }
+
+    private fun buildFingerprint(
+        treeSnapshot: TreeSnapshot,
+        clickableSnapshot: ClickableSnapshot,
+    ): String {
+        val fingerprintJson = JSONObject()
+            .put("packageName", treeSnapshot.packageName)
+            .put("tree", treeSnapshot.rootJson)
+            .put("clickables", clickableSnapshot.clickables)
+        return sha1Hex(fingerprintJson.toString()).take(12)
+    }
+
+    private fun sha1Hex(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-1").digest(value.toByteArray(StandardCharsets.UTF_8))
+        return buildString(digest.size * 2) {
+            digest.forEach { byte ->
+                append(((byte.toInt() ushr 4) and 0xF).toString(16))
+                append((byte.toInt() and 0xF).toString(16))
+            }
+        }
+    }
+
+    private fun pathToNodeId(path: List<Int>): String = if (path.isEmpty()) {
+        "root"
+    } else {
+        path.joinToString(".")
+    }
+
+    private fun findNodeById(
+        root: AccessibilityNodeInfo,
+        nodeId: String,
+    ): AccessibilityNodeInfo? {
+        if (nodeId == "root") {
+            return root
+        }
+
+        var current: AccessibilityNodeInfo? = root
+        for (part in nodeId.split('.')) {
+            val index = part.toIntOrNull() ?: return null
+            current = current?.getChild(index) ?: return null
+        }
+        return current
     }
 
     private fun findMatchingNode(
@@ -825,6 +1020,28 @@ private fun JSONObject.optDoubleOrDefault(
 ): Double {
     return if (has(key)) {
         optDouble(key, defaultValue)
+    } else {
+        defaultValue
+    }
+}
+
+private fun JSONObject.optLongOrDefault(
+    key: String,
+    defaultValue: Long,
+): Long {
+    return if (has(key)) {
+        optLong(key, defaultValue)
+    } else {
+        defaultValue
+    }
+}
+
+private fun JSONObject.optIntOrDefault(
+    key: String,
+    defaultValue: Int,
+): Int {
+    return if (has(key)) {
+        optInt(key, defaultValue)
     } else {
         defaultValue
     }
