@@ -10,11 +10,15 @@
 ## Android 端能力
 
 - `dump_tree`: 读取当前界面节点树并返回 JSON。
+- `current_app`: 返回当前前台应用包名。
+- `snapshot`: 一次性返回节点树、可点击节点和页面指纹。
 - `list_clickables`: 列出当前界面所有可点击或可聚焦节点，便于电脑端做遍历。
 - `click_text`: 按文本、内容描述或 view id 查找第一个匹配节点并点击。
+- `click_node`: 按 `list_clickables` 返回的 `nodeId` 点击节点。
 - `click_point`: 按屏幕坐标点击。
 - `scroll`: 优先走无障碍滚动动作，失败时退回手势滑动。
 - `back`: 执行 Android 全局返回。
+- `wait_for_stable_tree`: 轮询直到页面指纹稳定。
 - `screenshot`: 截图并把 JPEG 的 base64 数据放进响应。
 
 当前实现基于 Android 11 以上的 `AccessibilityService.takeScreenshot`，所以 `minSdk` 设为 `30`。
@@ -53,10 +57,23 @@ app/build/outputs/apk/debug/app-debug.apk
 python3 host/helper_client.py --pretty health
 ```
 
+查看前台应用：
+
+```bash
+python3 host/helper_client.py --pretty current-app
+```
+
 导出当前节点树：
 
 ```bash
 python3 host/helper_client.py --pretty dump-tree --output tree.json
+```
+
+导出当前快照：
+
+```bash
+python3 host/helper_client.py --pretty snapshot --output snapshot.json
+python3 host/helper_client.py --pretty snapshot --include-screenshot --output snapshot-with-image.json
 ```
 
 导出当前页可点击节点：
@@ -70,6 +87,12 @@ python3 host/helper_client.py --pretty list-clickables --output clickables.json
 ```bash
 python3 host/helper_client.py --pretty click-text "继续"
 python3 host/helper_client.py --pretty click-text "com.demo:id/confirm" --exact
+```
+
+按节点 ID 点击：
+
+```bash
+python3 host/helper_client.py --pretty click-node 0.0.0.1
 ```
 
 按坐标点击：
@@ -91,10 +114,29 @@ python3 host/helper_client.py --pretty scroll up --distance-ratio 0.7
 python3 host/helper_client.py --pretty back
 ```
 
+等待页面稳定：
+
+```bash
+python3 host/helper_client.py --pretty wait-for-stable-tree --timeout-ms 12000 --stable-samples 2
+```
+
 截图：
 
 ```bash
 python3 host/helper_client.py --pretty screenshot --output out/current.jpg
+```
+
+## Agent 工作流
+
+推荐给 Claude Code、Codex 这类代理的顺序：
+
+```bash
+python3 host/helper_client.py --pretty health
+python3 host/helper_client.py --pretty current-app
+python3 host/helper_client.py --pretty snapshot --output snapshot.json
+python3 host/helper_client.py --pretty wait-for-stable-tree
+python3 host/helper_client.py --pretty list-clickables --output clickables.json
+python3 host/helper_client.py --pretty click-node <nodeId>
 ```
 
 ## HTTP 协议
@@ -127,6 +169,14 @@ Content-Type: application/json
 ```
 
 ```json
+{"command":"current_app"}
+```
+
+```json
+{"command":"snapshot","includeScreenshot":false}
+```
+
+```json
 {"command":"back"}
 ```
 
@@ -139,7 +189,15 @@ Content-Type: application/json
 ```
 
 ```json
+{"command":"click_node","nodeId":"0.0.1"}
+```
+
+```json
 {"command":"screenshot"}
+```
+
+```json
+{"command":"wait_for_stable_tree","timeoutMs":10000,"pollIntervalMs":500,"stableSamples":2}
 ```
 
 响应体统一形态：

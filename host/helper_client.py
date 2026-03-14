@@ -105,9 +105,21 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
     subparsers.add_parser("health", help="Check service and server status")
+    subparsers.add_parser("current-app", help="Get the package name of the current foreground app")
 
     dump_tree = subparsers.add_parser("dump-tree", help="Fetch the current accessibility tree")
     dump_tree.add_argument("--output", type=Path, help="Write the JSON tree to a file")
+
+    snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Fetch tree, clickable nodes, and a stable page fingerprint",
+    )
+    snapshot.add_argument("--output", type=Path, help="Write the snapshot JSON to a file")
+    snapshot.add_argument(
+        "--include-screenshot",
+        action="store_true",
+        help="Include screenshot payload in the JSON response",
+    )
 
     list_clickables = subparsers.add_parser(
         "list-clickables",
@@ -127,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     click_point.add_argument("x", type=int)
     click_point.add_argument("y", type=int)
 
+    click_node = subparsers.add_parser("click-node", help="Click a node returned by list-clickables")
+    click_node.add_argument("node_id", help="Node identifier from the list-clickables response")
+
     scroll = subparsers.add_parser("scroll", help="Scroll the current screen")
     scroll.add_argument("direction", choices=["up", "down", "left", "right"])
     scroll.add_argument(
@@ -137,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("back", help="Trigger Android global back action")
+
+    wait_for_stable_tree = subparsers.add_parser(
+        "wait-for-stable-tree",
+        help="Poll until the current screen fingerprint becomes stable",
+    )
+    wait_for_stable_tree.add_argument("--timeout-ms", type=int, default=10000)
+    wait_for_stable_tree.add_argument("--poll-interval-ms", type=int, default=500)
+    wait_for_stable_tree.add_argument("--stable-samples", type=int, default=2)
 
     screenshot = subparsers.add_parser("screenshot", help="Capture a screenshot")
     screenshot.add_argument(
@@ -174,11 +197,30 @@ def main() -> int:
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
+        if args.command_name == "current-app":
+            response = client.command({"command": "current_app"})
+            print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
         if args.command_name == "dump-tree":
             response = client.command({"command": "dump_tree"})
             if args.output:
                 write_json(args.output, response)
                 print(f"Wrote tree JSON to {args.output}")
+            else:
+                print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
+        if args.command_name == "snapshot":
+            response = client.command(
+                {
+                    "command": "snapshot",
+                    "includeScreenshot": args.include_screenshot,
+                }
+            )
+            if args.output:
+                write_json(args.output, response)
+                print(f"Wrote snapshot JSON to {args.output}")
             else:
                 print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
@@ -214,6 +256,16 @@ def main() -> int:
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
+        if args.command_name == "click-node":
+            response = client.command(
+                {
+                    "command": "click_node",
+                    "nodeId": args.node_id,
+                }
+            )
+            print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
         if args.command_name == "scroll":
             response = client.command(
                 {
@@ -227,6 +279,18 @@ def main() -> int:
 
         if args.command_name == "back":
             response = client.command({"command": "back"})
+            print_json(response, args.pretty)
+            return 0 if response.get("ok") else 1
+
+        if args.command_name == "wait-for-stable-tree":
+            response = client.command(
+                {
+                    "command": "wait_for_stable_tree",
+                    "timeoutMs": args.timeout_ms,
+                    "pollIntervalMs": args.poll_interval_ms,
+                    "stableSamples": args.stable_samples,
+                }
+            )
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
