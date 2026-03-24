@@ -1,10 +1,23 @@
 <resources>
     <string name="app_name">AD Helper</string>
-    <string name="app_summary">通过无障碍服务暴露一个仅本地可访问的 HTTP 命令端口，供电脑端脚本读取节点树、点击、滚动和截图。</string>
+    <string name="app_summary">通过无障碍与前台运行时服务，在手机端稳定提供本地 HTTP 控制能力，供电脑端脚本读取节点树、点击、滚动和截图。</string>
     <string name="status_title">运行状态</string>
+    <string name="controls_title">控制</string>
+    <string name="diagnostics_title">诊断</string>
     <string name="steps_title">启用步骤</string>
+    <string name="start_helper">启动 Helper</string>
+    <string name="stop_helper">停止 Helper</string>
     <string name="open_accessibility_settings">打开无障碍设置</string>
+    <string name="copy_adb_command">复制 ADB 命令</string>
+    <string name="copy_diagnostics">复制诊断信息</string>
+    <string name="runtime_running">前台服务保活中</string>
+    <string name="runtime_stopped">前台服务未运行</string>
+    <string name="accessibility_connected">无障碍已连接</string>
+    <string name="accessibility_disconnected">无障碍未连接</string>
+    <string name="http_listening">HTTP 已监听</string>
+    <string name="http_not_listening">HTTP 未监听</string>
+    <string name="copied_to_clipboard">已复制到剪贴板</string>
     <string name="service_label">AD Helper Accessibility</string>
     <string name="service_description">允许电脑端脚本读取当前界面节点树并执行点击、滚动、截图。</string>
-    <string name="setup_steps">1. 安装并打开 App。\n2. 点击下方按钮，进入系统无障碍设置并启用 AD Helper Accessibility。\n3. 电脑端执行 adb forward tcp:7912 tcp:7912。\n4. 运行 host/helper_client.py，下发命令并接收结果。</string>
+    <string name="setup_steps">1. 点击“启动 Helper”，让前台运行时服务开始保活。\n2. 点击“打开无障碍设置”，启用 AD Helper Accessibility。\n3. 电脑端执行 adb forward tcp:7912 tcp:7912。\n4. 使用 host/helper_client.py 或兼容 Agent 发送命令。\n5. 如遇异常，可在本页复制诊断信息排查。</string>
 </resources>

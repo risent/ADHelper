@@ -82,44 +82,62 @@ class HelperAccessibilityService : AccessibilityService() {
         const val SERVER_PORT = 7912
         private const val MAX_TREE_NODES = 1500
         private const val TAG = "ADHelper"
-        private const val PREFS_NAME = "helper_status"
-        private const val KEY_SERVICE_CONNECTED = "service_connected"
-        private const val KEY_SERVER_RUNNING = "server_running"
-        private const val KEY_LAST_ERROR = "last_error"
-        private const val KEEP_LAST_ERROR = "\u0000KEEP\u0000"
+        private val activeInstanceRef = AtomicReference<HelperAccessibilityService?>()
+
+        fun activeInstance(): HelperAccessibilityService? = activeInstanceRef.get()
 
         fun statusSnapshot(context: Context): StatusSnapshot {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val snapshot = HelperRuntimeStateStore.snapshot(context.applicationContext)
             return StatusSnapshot(
-                serviceConnected = prefs.getBoolean(KEY_SERVICE_CONNECTED, false),
-                serverRunning = prefs.getBoolean(KEY_SERVER_RUNNING, false),
+                serviceConnected = snapshot.accessibilityConnected,
+                serverRunning = snapshot.httpServerListening,
                 port = SERVER_PORT,
-                lastError = prefs.getString(KEY_LAST_ERROR, null),
+                lastError = snapshot.lastErrorMessage,
             )
         }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
-    private val serverExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private var commandHttpServer: CommandHttpServer? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Accessibility service onCreate")
-        updateStatus(serviceConnected = false, serverRunning = false, lastError = null)
-        startCommandServerAsync()
+        activeInstanceRef.set(this)
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(accessibilityConnected = false)
+        }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "Accessibility service onServiceConnected")
-        updateStatus(serviceConnected = true, lastError = null)
-        startCommandServerAsync()
+        activeInstanceRef.set(this)
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(
+                accessibilityConnected = true,
+                lastErrorCode = null,
+                lastErrorMessage = null,
+            )
+        }
+        val snapshot = HelperRuntimeStateStore.snapshot(applicationContext)
+        if ((snapshot.helperRunning || snapshot.foregroundServiceRunning) &&
+            !HelperRuntimeService.isRunning(applicationContext)
+        ) {
+            Log.d(TAG, "Restarting runtime service after accessibility rebind")
+            HelperRuntimeService.start(applicationContext)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Intentionally no-op. Commands are pulled over HTTP.
+        val packageName = event?.packageName?.toString()?.takeIf { it.isNotBlank() } ?: return
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            if (current.currentForegroundPackage == packageName) {
+                current
+            } else {
+                current.copy(currentForegroundPackage = packageName)
+            }
+        }
     }
 
     override fun onInterrupt() {
@@ -128,85 +146,17 @@ class HelperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         Log.d(TAG, "Accessibility service onDestroy")
-        stopCommandServer()
         screenshotExecutor.shutdownNow()
-        serverExecutor.shutdownNow()
-        updateStatus(serviceConnected = false, serverRunning = false, lastError = null)
+        if (activeInstanceRef.get() === this) {
+            activeInstanceRef.set(null)
+        }
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(accessibilityConnected = false)
+        }
         super.onDestroy()
     }
 
-    private fun startCommandServerAsync() {
-        serverExecutor.execute {
-            Log.d(TAG, "startCommandServerAsync invoked")
-            if (commandHttpServer?.isRunning() == true) {
-                Log.d(TAG, "Command server already marked running")
-                updateStatus(serverRunning = true)
-                return@execute
-            }
-
-            try {
-                val server = CommandHttpServer(SERVER_PORT) { method, path, body ->
-                    handleHttpRequest(method, path, body)
-                }
-                server.start()
-                commandHttpServer = server
-                Log.d(TAG, "Command server start() returned successfully")
-                updateStatus(serverRunning = true, lastError = null)
-            } catch (exception: Exception) {
-                Log.e(TAG, "Failed to start command server", exception)
-                updateStatus(
-                    serverRunning = false,
-                    lastError = exception.message ?: exception.javaClass.simpleName,
-                )
-            }
-        }
-    }
-
-    private fun stopCommandServer() {
-        Log.d(TAG, "Stopping command server")
-        commandHttpServer?.stop()
-        commandHttpServer = null
-        updateStatus(serverRunning = false)
-    }
-
-    private fun handleHttpRequest(
-        method: String,
-        path: String,
-        body: String,
-    ): CommandHttpServer.HttpResponse {
-        return try {
-            when {
-                method == "GET" && path == "/health" -> jsonResponse(200, buildHealthResponse())
-                method == "POST" && path == "/command" -> {
-                    val request = if (body.isBlank()) JSONObject() else JSONObject(body)
-                    jsonResponse(200, executeCommand(request))
-                }
-
-                method != "GET" && method != "POST" -> jsonResponse(
-                    405,
-                    errorPayload("Method $method is not supported"),
-                )
-
-                else -> jsonResponse(404, errorPayload("Unknown route: $path"))
-            }
-        } catch (exception: IllegalArgumentException) {
-            jsonResponse(400, errorPayload(exception.message ?: "Bad request"))
-        } catch (exception: Exception) {
-            Log.e(TAG, "Command handling failed", exception)
-            updateStatus(lastError = exception.message ?: exception.javaClass.simpleName)
-            jsonResponse(500, errorPayload(exception.message ?: "Internal error"))
-        }
-    }
-
-    private fun buildHealthResponse(): JSONObject = JSONObject()
-        .put("ok", true)
-        .put("packageName", packageName)
-        .put("serviceConnected", statusSnapshot(this).serviceConnected)
-        .put("serverRunning", statusSnapshot(this).serverRunning)
-        .put("port", SERVER_PORT)
-        .put("sdkInt", Build.VERSION.SDK_INT)
-        .put("deviceModel", Build.MODEL)
-        .put("lastError", statusSnapshot(this).lastError)
+    fun executeRuntimeCommand(request: JSONObject): JSONObject = executeCommand(request)
 
     private fun executeCommand(request: JSONObject): JSONObject {
         val command = request.optString("command").trim()
@@ -962,39 +912,6 @@ class HelperAccessibilityService : AccessibilityService() {
 
         @Suppress("UNCHECKED_CAST")
         return valueRef.get() as T
-    }
-
-    private fun jsonResponse(
-        statusCode: Int,
-        payload: JSONObject,
-    ): CommandHttpServer.HttpResponse = CommandHttpServer.HttpResponse(
-        statusCode = statusCode,
-        body = payload.toString().toByteArray(StandardCharsets.UTF_8),
-    )
-
-    private fun errorPayload(message: String): JSONObject = JSONObject()
-        .put("ok", false)
-        .put("error", message)
-
-    private fun updateStatus(
-        serviceConnected: Boolean? = null,
-        serverRunning: Boolean? = null,
-        lastError: String? = KEEP_LAST_ERROR,
-    ) {
-        Log.d(
-            TAG,
-            "updateStatus serviceConnected=$serviceConnected serverRunning=$serverRunning lastError=$lastError",
-        )
-        val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().apply {
-            serviceConnected?.let { putBoolean(KEY_SERVICE_CONNECTED, it) }
-            serverRunning?.let { putBoolean(KEY_SERVER_RUNNING, it) }
-            when (lastError) {
-                KEEP_LAST_ERROR -> Unit
-                null -> remove(KEY_LAST_ERROR)
-                else -> putString(KEY_LAST_ERROR, lastError)
-            }
-        }.apply()
     }
 
     private class TreeBuildState {
