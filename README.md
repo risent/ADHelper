@@ -1,10 +1,12 @@
 # AD Helper
 
-独立 Android helper，用无障碍服务把当前界面节点树、点击、滚动和截图能力暴露给电脑端脚本。
+独立 Android helper，用“前台运行时服务 + 无障碍服务”把当前界面节点树、点击、滚动和截图能力稳定地暴露给电脑端脚本。
 
 ## 组成
 
-- Android 端是一个独立 App，核心在 `HelperAccessibilityService`，通过本地 HTTP 端口 `7912` 接收命令。
+- Android 端是一个独立 App。
+  - `HelperRuntimeService` 负责前台通知保活、HTTP server、状态管理和命令串行执行。
+  - `HelperAccessibilityService` 负责读取当前界面、点击、滚动、截图等无障碍能力。
 - 电脑端脚本是 `host/helper_client.py`，通过 `adb forward tcp:7912 tcp:7912` 把请求发到手机，并直接接收 JSON 结果。
 
 ## Android 端能力
@@ -26,14 +28,15 @@
 ## 启用方式
 
 1. 用 Android Studio 打开这个工程并安装到设备。
-2. 打开 App，进入系统无障碍设置，启用 `AD Helper Accessibility`。
-3. 电脑执行：
+2. 打开 App，点击 `启动 Helper`，让前台运行时服务和常驻通知启动。
+3. 点击 `打开无障碍设置`，启用 `AD Helper Accessibility`。
+4. 电脑执行：
 
 ```bash
 adb forward tcp:7912 tcp:7912
 ```
 
-4. 用桌面端脚本下发命令。
+5. 用桌面端脚本下发命令。
 
 ## 构建
 

@@ -173,8 +173,10 @@ class CommandHttpServer(
     private fun statusReason(statusCode: Int): String = when (statusCode) {
         200 -> "OK"
         400 -> "Bad Request"
+        409 -> "Conflict"
         404 -> "Not Found"
         405 -> "Method Not Allowed"
+        504 -> "Gateway Timeout"
         500 -> "Internal Server Error"
         503 -> "Service Unavailable"
         else -> "OK"
