@@ -1,18 +1,18 @@
 package com.adhelper.helper
 
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import android.content.pm.ServiceInfo
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
@@ -35,10 +35,16 @@ class HelperRuntimeService : Service() {
         private const val ACTION_START = "com.adhelper.helper.action.START"
         private const val ACTION_STOP = "com.adhelper.helper.action.STOP"
         private const val ACTION_REFRESH_NOTIFICATION = "com.adhelper.helper.action.REFRESH_NOTIFICATION"
+        private const val ACTION_RELOAD_TRANSPORT = "com.adhelper.helper.action.RELOAD_TRANSPORT"
         private const val SCHEMA_VERSION = 2
 
         fun start(context: Context) {
             val intent = Intent(context, HelperRuntimeService::class.java).setAction(ACTION_START)
+            ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun reloadTransport(context: Context) {
+            val intent = Intent(context, HelperRuntimeService::class.java).setAction(ACTION_RELOAD_TRANSPORT)
             ContextCompat.startForegroundService(context, intent)
         }
 
@@ -68,6 +74,11 @@ class HelperRuntimeService : Service() {
         val message: String,
     )
 
+    private data class RuntimeResponse(
+        val statusCode: Int,
+        val payload: JSONObject,
+    )
+
     private class HelperCommandException(
         val statusCode: Int,
         val errorCode: String,
@@ -80,20 +91,28 @@ class HelperRuntimeService : Service() {
     private val notificationRefresh = object : Runnable {
         override fun run() {
             updateNotification()
-            mainHandler.postDelayed(this, 2000L)
+            mainHandler.postDelayed(this, 2_000L)
         }
     }
 
     private var commandHttpServer: CommandHttpServer? = null
+    private var remoteCommandClient: RemoteCommandClient? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Runtime service onCreate")
+        val config = HelperRuntimeStateStore.remoteConfig(applicationContext)
         HelperRuntimeStateStore.update(applicationContext) { current ->
             current.copy(
                 helperRunning = true,
                 foregroundServiceRunning = true,
                 httpServerListening = false,
+                transportMode = config.transportMode.wireValue,
+                remoteServerUrl = config.serverUrl,
+                remoteDeviceId = config.deviceId,
+                remoteHasToken = !config.sharedToken.isNullOrBlank(),
+                remoteConnecting = false,
+                remoteConnected = false,
                 activeCommand = null,
                 activeRequestId = null,
                 activeCommandStartedAt = 0L,
@@ -111,12 +130,11 @@ class HelperRuntimeService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        startCommandServer()
+        applyTransportMode()
         mainHandler.post(notificationRefresh)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "Runtime service onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_STOP -> {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -125,6 +143,7 @@ class HelperRuntimeService : Service() {
             }
 
             ACTION_REFRESH_NOTIFICATION -> updateNotification()
+            ACTION_RELOAD_TRANSPORT -> applyTransportMode()
             ACTION_START, null -> {
                 HelperRuntimeStateStore.update(applicationContext) { current ->
                     current.copy(
@@ -132,11 +151,7 @@ class HelperRuntimeService : Service() {
                         foregroundServiceRunning = true,
                     )
                 }
-                if (commandHttpServer?.isRunning() != true) {
-                    startCommandServer()
-                } else {
-                    updateNotification()
-                }
+                applyTransportMode()
             }
         }
 
@@ -144,16 +159,18 @@ class HelperRuntimeService : Service() {
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "Runtime service onDestroy")
         mainHandler.removeCallbacks(notificationRefresh)
-        commandHttpServer?.stop()
-        commandHttpServer = null
+        stopLocalHttpServer()
+        remoteCommandClient?.stop()
+        remoteCommandClient = null
         commandExecutor.shutdownNow()
         HelperRuntimeStateStore.update(applicationContext) { current ->
             current.copy(
                 helperRunning = false,
                 foregroundServiceRunning = false,
                 httpServerListening = false,
+                remoteConnecting = false,
+                remoteConnected = false,
                 activeCommand = null,
                 activeRequestId = null,
                 activeCommandStartedAt = 0L,
@@ -164,7 +181,32 @@ class HelperRuntimeService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startCommandServer() {
+    private fun applyTransportMode() {
+        val config = HelperRuntimeStateStore.remoteConfig(applicationContext)
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(
+                transportMode = config.transportMode.wireValue,
+                remoteServerUrl = config.serverUrl,
+                remoteDeviceId = config.deviceId,
+                remoteHasToken = !config.sharedToken.isNullOrBlank(),
+                lastErrorCode = null,
+                lastErrorMessage = null,
+            )
+        }
+
+        if (config.transportMode == TransportMode.LOCAL) {
+            remoteCommandClient?.stop()
+            remoteCommandClient = null
+            setRemoteState(connecting = false, connected = false, errorMessage = null)
+            startLocalHttpServer()
+        } else {
+            stopLocalHttpServer()
+            startRemoteClient()
+        }
+        updateNotification()
+    }
+
+    private fun startLocalHttpServer() {
         if (commandHttpServer?.isRunning() == true) {
             return
         }
@@ -183,7 +225,7 @@ class HelperRuntimeService : Service() {
                 )
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "Failed to start runtime HTTP server", exception)
+            Log.e(TAG, "Failed to start local HTTP server", exception)
             HelperRuntimeStateStore.update(applicationContext) { current ->
                 current.copy(
                     httpServerListening = false,
@@ -192,7 +234,72 @@ class HelperRuntimeService : Service() {
                 )
             }
         }
+    }
+
+    private fun stopLocalHttpServer() {
+        commandHttpServer?.stop()
+        commandHttpServer = null
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(httpServerListening = false)
+        }
+    }
+
+    private fun startRemoteClient() {
+        if (remoteCommandClient == null) {
+            remoteCommandClient = RemoteCommandClient(
+                configProvider = { HelperRuntimeStateStore.remoteConfig(applicationContext) },
+                helloPayloadProvider = { buildHelloPayload() },
+                statusPayloadProvider = { buildHealthPayload() },
+                commandHandler = { requestId, payload ->
+                    val response = executeCommandRequest(payload, requestId)
+                    RemoteCommandClient.DispatchResult(response.statusCode, response.payload)
+                },
+                stateListener = { connecting, connected, errorMessage ->
+                    setRemoteState(connecting, connected, errorMessage)
+                },
+            )
+        }
+        remoteCommandClient?.start()
+    }
+
+    private fun setRemoteState(connecting: Boolean, connected: Boolean, errorMessage: String?) {
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(
+                remoteConnecting = connecting,
+                remoteConnected = connected,
+                lastErrorCode = if (errorMessage.isNullOrBlank()) current.lastErrorCode else "REMOTE_CONNECTION",
+                lastErrorMessage = errorMessage ?: current.lastErrorMessage,
+            )
+        }
         updateNotification()
+    }
+
+    private fun buildHelloPayload(): JSONObject {
+        val snapshot = HelperRuntimeStateStore.snapshot(applicationContext)
+        return JSONObject()
+            .put("schemaVersion", SCHEMA_VERSION)
+            .put("deviceId", snapshot.remoteDeviceId)
+            .put("transportMode", snapshot.transportMode)
+            .put("deviceModel", Build.MODEL)
+            .put("sdkInt", Build.VERSION.SDK_INT)
+            .put("packageName", packageName)
+            .put("health", buildHealthPayload())
+            .put(
+                "supportedCommands",
+                listOf(
+                    "current_app",
+                    "dump_tree",
+                    "snapshot",
+                    "list_clickables",
+                    "click_text",
+                    "click_node",
+                    "click_point",
+                    "scroll",
+                    "back",
+                    "wait_for_stable_tree",
+                    "screenshot",
+                ),
+            )
     }
 
     private fun handleHttpRequest(
@@ -200,55 +307,50 @@ class HelperRuntimeService : Service() {
         path: String,
         body: String,
     ): CommandHttpServer.HttpResponse {
-        return try {
-            when {
-                method == "GET" && path == "/health" -> successResponse(
-                    command = "health",
-                    requestId = "health",
-                    startedAt = System.currentTimeMillis(),
-                    result = buildHealthPayload(),
-                )
-
-                method == "POST" && path == "/command" -> handleCommandRequest(body)
-
-                method != "GET" && method != "POST" -> errorResponse(
-                    statusCode = 405,
-                    requestId = "n/a",
-                    errorCode = "METHOD_NOT_ALLOWED",
-                    message = "Method $method is not supported",
-                )
-
-                else -> errorResponse(
-                    statusCode = 404,
-                    requestId = "n/a",
-                    errorCode = "NOT_FOUND",
-                    message = "Unknown route: $path",
-                )
-            }
-        } catch (exception: Exception) {
-            Log.e(TAG, "HTTP request failed", exception)
-            errorResponse(
-                statusCode = 500,
+        val response = when {
+            method == "GET" && path == "/health" -> buildHealthResponse()
+            method == "POST" && path == "/command" -> executeCommandRequest(if (body.isBlank()) JSONObject() else JSONObject(body))
+            method != "GET" && method != "POST" -> errorResponse(
+                statusCode = 405,
                 requestId = "n/a",
-                errorCode = "INTERNAL_ERROR",
-                message = exception.message ?: "Internal error",
+                errorCode = "METHOD_NOT_ALLOWED",
+                message = "Method $method is not supported",
+            )
+
+            else -> errorResponse(
+                statusCode = 404,
+                requestId = "n/a",
+                errorCode = "NOT_FOUND",
+                message = "Unknown route: $path",
             )
         }
+        return CommandHttpServer.HttpResponse(
+            statusCode = response.statusCode,
+            body = response.payload.toString().toByteArray(StandardCharsets.UTF_8),
+        )
     }
 
-    private fun handleCommandRequest(body: String): CommandHttpServer.HttpResponse {
-        val request = if (body.isBlank()) JSONObject() else JSONObject(body)
+    private fun buildHealthResponse(): RuntimeResponse {
+        val payload = JSONObject()
+            .put("ok", true)
+            .put("schemaVersion", SCHEMA_VERSION)
+            .put("requestId", "health")
+            .put("command", "health")
+            .put("timestamp", System.currentTimeMillis())
+            .put("durationMs", 0L)
+            .put("result", buildHealthPayload())
+        return RuntimeResponse(statusCode = 200, payload = payload)
+    }
+
+    private fun executeCommandRequest(
+        request: JSONObject,
+        requestId: String = UUID.randomUUID().toString(),
+    ): RuntimeResponse {
         val command = request.optString("command").trim()
-        val requestId = UUID.randomUUID().toString()
         val startedAt = System.currentTimeMillis()
 
         if (command.isBlank()) {
-            return errorResponse(
-                statusCode = 400,
-                requestId = requestId,
-                errorCode = "BAD_REQUEST",
-                message = "Missing command",
-            )
+            return errorResponse(400, requestId, "BAD_REQUEST", "Missing command")
         }
 
         if (command == "current_app") {
@@ -265,10 +367,7 @@ class HelperRuntimeService : Service() {
             val busyPayload = JSONObject()
                 .put("activeCommand", currentActive?.command)
                 .put("activeRequestId", currentActive?.requestId)
-                .put(
-                    "elapsedMs",
-                    currentActive?.let { System.currentTimeMillis() - it.startedAt } ?: 0L,
-                )
+                .put("elapsedMs", currentActive?.let { System.currentTimeMillis() - it.startedAt } ?: 0L)
             return errorResponse(
                 statusCode = 409,
                 requestId = requestId,
@@ -309,7 +408,7 @@ class HelperRuntimeService : Service() {
             }
         }
 
-        return try {
+        val response = try {
             val result = future.get(commandTimeoutMs(command, request), TimeUnit.MILLISECONDS)
             HelperRuntimeStateStore.update(applicationContext) { current ->
                 current.copy(
@@ -319,58 +418,28 @@ class HelperRuntimeService : Service() {
                     lastErrorMessage = null,
                 )
             }
-            updateNotification()
             successResponse(command, requestId, startedAt, result)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
-            HelperRuntimeStateStore.update(applicationContext) { current ->
-                current.copy(
-                    lastCommand = command,
-                    lastErrorCode = "COMMAND_INTERRUPTED",
-                    lastErrorMessage = "Command $command was interrupted",
-                )
-            }
-            updateNotification()
-            errorResponse(
-                statusCode = 500,
-                requestId = requestId,
-                errorCode = "COMMAND_INTERRUPTED",
-                message = "Command $command was interrupted",
-            )
+            errorResponse(500, requestId, "COMMAND_INTERRUPTED", "Command $command was interrupted")
         } catch (_: TimeoutException) {
             future.cancel(true)
-            HelperRuntimeStateStore.update(applicationContext) { current ->
-                current.copy(
-                    lastCommand = command,
-                    lastErrorCode = "COMMAND_TIMEOUT",
-                    lastErrorMessage = "Command $command timed out",
-                )
-            }
-            updateNotification()
-            errorResponse(
-                statusCode = 504,
-                requestId = requestId,
-                errorCode = "COMMAND_TIMEOUT",
-                message = "Command $command timed out",
-            )
+            errorResponse(504, requestId, "COMMAND_TIMEOUT", "Command $command timed out")
         } catch (exception: ExecutionException) {
-            val cause = exception.cause ?: exception
-            val failure = classifyFailure(cause)
-            HelperRuntimeStateStore.update(applicationContext) { current ->
-                current.copy(
-                    lastCommand = command,
-                    lastErrorCode = failure.errorCode,
-                    lastErrorMessage = failure.message,
-                )
-            }
-            updateNotification()
-            errorResponse(
-                statusCode = failure.statusCode,
-                requestId = requestId,
-                errorCode = failure.errorCode,
-                message = failure.message,
+            val failure = classifyFailure(exception.cause ?: exception)
+            errorResponse(failure.statusCode, requestId, failure.errorCode, failure.message)
+        }
+
+        HelperRuntimeStateStore.update(applicationContext) { current ->
+            current.copy(
+                lastCommand = command,
+                lastErrorCode = if (response.payload.optBoolean("ok")) null else response.payload.optString("errorCode"),
+                lastErrorMessage = if (response.payload.optBoolean("ok")) null else response.payload.optString("error"),
             )
         }
+        remoteCommandClient?.sendStatusUpdate("command_result")
+        updateNotification()
+        return response
     }
 
     private fun executeCommand(request: JSONObject): JSONObject {
@@ -383,10 +452,7 @@ class HelperRuntimeService : Service() {
         return service.executeRuntimeCommand(request)
     }
 
-    private fun commandTimeoutMs(
-        command: String,
-        request: JSONObject,
-    ): Long = when (command.lowercase(Locale.US)) {
+    private fun commandTimeoutMs(command: String, request: JSONObject): Long = when (command.lowercase(Locale.US)) {
         "click_text", "click_node", "click_point", "back" -> 5_000L
         "scroll" -> 8_000L
         "screenshot" -> 12_000L
@@ -397,51 +463,19 @@ class HelperRuntimeService : Service() {
 
     private fun classifyFailure(throwable: Throwable): CommandFailure {
         if (throwable is HelperCommandException) {
-            return CommandFailure(
-                statusCode = throwable.statusCode,
-                errorCode = throwable.errorCode,
-                message = throwable.message,
-            )
+            return CommandFailure(throwable.statusCode, throwable.errorCode, throwable.message)
         }
 
         val message = throwable.message ?: throwable.javaClass.simpleName
         return when {
-            throwable is IllegalArgumentException && message.startsWith("No node matched") -> CommandFailure(
-                statusCode = 400,
-                errorCode = "NODE_NOT_FOUND",
-                message = message,
-            )
-
-            message.contains("No active window", ignoreCase = true) -> CommandFailure(
-                statusCode = 503,
-                errorCode = "NO_ACTIVE_WINDOW",
-                message = message,
-            )
-
+            throwable is IllegalArgumentException && message.startsWith("No node matched") -> CommandFailure(400, "NODE_NOT_FOUND", message)
+            message.contains("No active window", ignoreCase = true) -> CommandFailure(503, "NO_ACTIVE_WINDOW", message)
             message.contains("Timed out while waiting for screenshot", ignoreCase = true) ||
-                message.contains("takeScreenshot failed", ignoreCase = true) -> CommandFailure(
-                    statusCode = 503,
-                    errorCode = "SCREENSHOT_FAILED",
-                    message = message,
-                )
+                message.contains("takeScreenshot failed", ignoreCase = true) -> CommandFailure(503, "SCREENSHOT_FAILED", message)
 
-            message.contains("Timed out waiting for main thread", ignoreCase = true) -> CommandFailure(
-                statusCode = 503,
-                errorCode = "MAIN_THREAD_TIMEOUT",
-                message = message,
-            )
-
-            message.contains("Missing command", ignoreCase = true) -> CommandFailure(
-                statusCode = 400,
-                errorCode = "BAD_REQUEST",
-                message = message,
-            )
-
-            else -> CommandFailure(
-                statusCode = 500,
-                errorCode = "INTERNAL_ERROR",
-                message = message,
-            )
+            message.contains("Timed out waiting for main thread", ignoreCase = true) -> CommandFailure(503, "MAIN_THREAD_TIMEOUT", message)
+            message.contains("Missing command", ignoreCase = true) -> CommandFailure(400, "BAD_REQUEST", message)
+            else -> CommandFailure(500, "INTERNAL_ERROR", message)
         }
     }
 
@@ -466,7 +500,7 @@ class HelperRuntimeService : Service() {
         requestId: String,
         startedAt: Long,
         result: JSONObject,
-    ): CommandHttpServer.HttpResponse {
+    ): RuntimeResponse {
         val payload = JSONObject()
             .put("ok", true)
             .put("schemaVersion", SCHEMA_VERSION)
@@ -475,7 +509,7 @@ class HelperRuntimeService : Service() {
             .put("timestamp", System.currentTimeMillis())
             .put("durationMs", System.currentTimeMillis() - startedAt)
             .put("result", result)
-        return jsonResponse(200, payload)
+        return RuntimeResponse(200, payload)
     }
 
     private fun errorResponse(
@@ -484,7 +518,7 @@ class HelperRuntimeService : Service() {
         errorCode: String,
         message: String,
         extra: JSONObject? = null,
-    ): CommandHttpServer.HttpResponse {
+    ): RuntimeResponse {
         val payload = JSONObject()
             .put("ok", false)
             .put("schemaVersion", SCHEMA_VERSION)
@@ -496,22 +530,13 @@ class HelperRuntimeService : Service() {
                 payload.put(key, extraJson.get(key))
             }
         }
-        return jsonResponse(statusCode, payload)
+        return RuntimeResponse(statusCode, payload)
     }
-
-    private fun jsonResponse(
-        statusCode: Int,
-        payload: JSONObject,
-    ): CommandHttpServer.HttpResponse = CommandHttpServer.HttpResponse(
-        statusCode = statusCode,
-        body = payload.toString().toByteArray(StandardCharsets.UTF_8),
-    )
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             return
         }
-
         val manager = getSystemService(NotificationManager::class.java) ?: return
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -527,13 +552,30 @@ class HelperRuntimeService : Service() {
         .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
         .setContentTitle("AD Helper 正在运行")
         .setContentText(
-            "HTTP ${snapshot.port} · ${if (snapshot.accessibilityConnected) "无障碍已连接" else "无障碍未连接"}",
+            if (snapshot.transportMode == TransportMode.REMOTE.wireValue) {
+                "Remote ${snapshot.remoteDeviceId ?: "未配置"} · ${if (snapshot.remoteConnected) "已连接" else "未连接"}"
+            } else {
+                "HTTP ${snapshot.port} · ${if (snapshot.accessibilityConnected) "无障碍已连接" else "无障碍未连接"}"
+            },
         )
         .setStyle(
             NotificationCompat.BigTextStyle().bigText(
                 buildString {
-                    append("HTTP ${snapshot.port}: ")
-                    append(if (snapshot.httpServerListening) "已监听" else "未监听")
+                    append("模式: ")
+                    append(snapshot.transportMode)
+                    append('\n')
+                    if (snapshot.transportMode == TransportMode.REMOTE.wireValue) {
+                        append("Remote: ")
+                        append(if (snapshot.remoteConnected) "已连接" else if (snapshot.remoteConnecting) "连接中" else "未连接")
+                        snapshot.remoteServerUrl?.let {
+                            append('\n')
+                            append("Server: ")
+                            append(it)
+                        }
+                    } else {
+                        append("HTTP ${snapshot.port}: ")
+                        append(if (snapshot.httpServerListening) "已监听" else "未监听")
+                    }
                     append('\n')
                     append("无障碍: ")
                     append(if (snapshot.accessibilityConnected) "已连接" else "未连接")
