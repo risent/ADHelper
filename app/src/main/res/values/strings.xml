@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">AD Helper</string>
-    <string name="app_summary">通过无障碍与前台运行时服务，在手机端稳定提供本地 HTTP 控制能力，供电脑端脚本读取节点树、点击、滚动和截图。</string>
+    <string name="app_summary">通过无障碍与前台运行时服务，在手机端提供本地 HTTP 控制和远程 Server-Client 控制能力，供桌面脚本或服务端读取节点树、点击、滚动和截图。</string>
     <string name="status_title">运行状态</string>
     <string name="controls_title">控制</string>
     <string name="diagnostics_title">诊断</string>
@@ -10,6 +10,13 @@
     <string name="open_accessibility_settings">打开无障碍设置</string>
     <string name="copy_adb_command">复制 ADB 命令</string>
     <string name="copy_diagnostics">复制诊断信息</string>
+    <string name="remote_config_title">远程配置</string>
+    <string name="local_mode">本地模式</string>
+    <string name="remote_mode">远程模式</string>
+    <string name="server_url_hint">Server URL，例如 http://192.168.1.10:8080</string>
+    <string name="device_id_hint">Device ID</string>
+    <string name="shared_token_hint">Shared Token</string>
+    <string name="save_remote_config">保存远程配置</string>
     <string name="runtime_running">前台服务保活中</string>
     <string name="runtime_stopped">前台服务未运行</string>
     <string name="accessibility_connected">无障碍已连接</string>
@@ -19,5 +26,5 @@
     <string name="copied_to_clipboard">已复制到剪贴板</string>
     <string name="service_label">AD Helper Accessibility</string>
     <string name="service_description">允许电脑端脚本读取当前界面节点树并执行点击、滚动、截图。</string>
-    <string name="setup_steps">1. 点击“启动 Helper”，让前台运行时服务开始保活。\n2. 点击“打开无障碍设置”，启用 AD Helper Accessibility。\n3. 电脑端执行 adb forward tcp:7912 tcp:7912。\n4. 使用 host/helper_client.py 或兼容 Agent 发送命令。\n5. 如遇异常，可在本页复制诊断信息排查。</string>
+    <string name="setup_steps">1. 点击“启动 Helper”，让前台运行时服务开始保活。\n2. 点击“打开无障碍设置”，启用 AD Helper Accessibility。\n3. 本地模式下，电脑端执行 adb forward tcp:7912 tcp:7912。\n4. 远程模式下，填写 Server URL、Device ID、Token 并保存。\n5. 使用 host/helper_client.py、本地脚本或远程 Server 发送命令。</string>
 </resources>

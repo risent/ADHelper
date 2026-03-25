@@ -7,4 +7,5 @@ build/
 captures/
 app/build/
 host/__pycache__/
+server/__pycache__/
 tmp/

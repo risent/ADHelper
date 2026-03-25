@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -18,7 +19,15 @@ class HelperClientError(RuntimeError):
     pass
 
 
-class HelperClient:
+class BaseHelperClient:
+    def health(self) -> dict:
+        raise NotImplementedError
+
+    def command(self, payload: dict) -> dict:
+        raise NotImplementedError
+
+
+class LocalHelperClient(BaseHelperClient):
     def __init__(self, serial: str | None, port: int, auto_forward: bool) -> None:
         self.serial = serial
         self.port = port
@@ -30,9 +39,11 @@ class HelperClient:
         self._run_adb("forward", f"tcp:{self.port}", f"tcp:{self.port}")
 
     def health(self) -> dict:
+        self.ensure_forward()
         return self._request("GET", "/health")
 
     def command(self, payload: dict) -> dict:
+        self.ensure_forward()
         return self._request("POST", "/command", payload)
 
     def _run_adb(self, *args: str) -> str:
@@ -67,22 +78,60 @@ class HelperClient:
             headers=headers,
             method=method,
         )
+        return request_json(request, local_mode=True)
 
+
+class ServerHelperClient(BaseHelperClient):
+    def __init__(self, server_url: str, device_id: str, token: str) -> None:
+        self.server_url = server_url.rstrip("/")
+        self.device_id = device_id
+        self.token = token
+
+    def health(self) -> dict:
+        request = urllib.request.Request(
+            url=f"{self.server_url}/api/devices/{urllib.parse.quote(self.device_id)}",
+            headers=self._headers(),
+            method="GET",
+        )
+        return request_json(request, local_mode=False)
+
+    def command(self, payload: dict) -> dict:
+        request = urllib.request.Request(
+            url=f"{self.server_url}/api/devices/{urllib.parse.quote(self.device_id)}/commands",
+            headers=self._headers({"Content-Type": "application/json"}),
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+        )
+        return request_json(request, local_mode=False)
+
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if extra:
+            headers.update(extra)
+        return headers
+
+
+def request_json(request: urllib.request.Request, *, local_mode: bool) -> dict:
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise HelperClientError(f"HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
+            return json.loads(body)
+        except json.JSONDecodeError as decode_error:
+            raise HelperClientError(f"HTTP {exc.code}: {body}") from decode_error
+    except urllib.error.URLError as exc:
+        if local_mode:
             raise HelperClientError(
                 "Unable to reach helper app. Is the app installed, the accessibility service enabled, "
                 "and adb forward configured?"
             ) from exc
-        except TimeoutError as exc:
-            raise HelperClientError("Timed out while waiting for helper app response") from exc
-        except socket.timeout as exc:
-            raise HelperClientError("Timed out while waiting for helper app response") from exc
+        raise HelperClientError("Unable to reach remote ADHelper server") from exc
+    except TimeoutError as exc:
+        raise HelperClientError("Timed out while waiting for helper response") from exc
+    except socket.timeout as exc:
+        raise HelperClientError("Timed out while waiting for helper response") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,85 +140,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--serial", help="ADB device serial")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Forwarded localhost port")
-    parser.add_argument(
-        "--no-forward",
-        action="store_true",
-        help="Skip running adb forward before sending the request",
-    )
-    parser.add_argument(
-        "--pretty",
-        action="store_true",
-        help="Pretty print JSON responses",
-    )
+    parser.add_argument("--no-forward", action="store_true", help="Skip adb forward in local mode")
+    parser.add_argument("--server-url", help="Use remote server mode, e.g. http://127.0.0.1:8080")
+    parser.add_argument("--device-id", help="Remote device ID when using --server-url")
+    parser.add_argument("--token", help="Bearer token when using --server-url")
+    parser.add_argument("--pretty", action="store_true", help="Pretty print JSON responses")
 
     subparsers = parser.add_subparsers(dest="command_name", required=True)
-
     subparsers.add_parser("health", help="Check service and server status")
     subparsers.add_parser("current-app", help="Get the package name of the current foreground app")
 
     dump_tree = subparsers.add_parser("dump-tree", help="Fetch the current accessibility tree")
     dump_tree.add_argument("--output", type=Path, help="Write the JSON tree to a file")
 
-    snapshot = subparsers.add_parser(
-        "snapshot",
-        help="Fetch tree, clickable nodes, and a stable page fingerprint",
-    )
+    snapshot = subparsers.add_parser("snapshot", help="Fetch tree, clickable nodes, and a stable page fingerprint")
     snapshot.add_argument("--output", type=Path, help="Write the snapshot JSON to a file")
-    snapshot.add_argument(
-        "--include-screenshot",
-        action="store_true",
-        help="Include screenshot payload in the JSON response",
-    )
+    snapshot.add_argument("--include-screenshot", action="store_true", help="Include screenshot payload in the JSON response")
 
-    list_clickables = subparsers.add_parser(
-        "list-clickables",
-        help="List clickable or focusable nodes on the current screen",
-    )
+    list_clickables = subparsers.add_parser("list-clickables", help="List clickable or focusable nodes")
     list_clickables.add_argument("--output", type=Path, help="Write the clickable-node JSON to a file")
 
     click_text = subparsers.add_parser("click-text", help="Click the first node matching text")
     click_text.add_argument("text", help="Text or content description to match")
-    click_text.add_argument(
-        "--exact",
-        action="store_true",
-        help="Require exact case-insensitive match instead of contains",
-    )
+    click_text.add_argument("--exact", action="store_true", help="Require exact case-insensitive match")
 
     click_point = subparsers.add_parser("click-point", help="Tap by screen coordinate")
     click_point.add_argument("x", type=int)
     click_point.add_argument("y", type=int)
 
     click_node = subparsers.add_parser("click-node", help="Click a node returned by list-clickables")
-    click_node.add_argument("node_id", help="Node identifier from the list-clickables response")
+    click_node.add_argument("node_id", help="Node identifier from list-clickables")
 
     scroll = subparsers.add_parser("scroll", help="Scroll the current screen")
     scroll.add_argument("direction", choices=["up", "down", "left", "right"])
-    scroll.add_argument(
-        "--distance-ratio",
-        type=float,
-        default=0.55,
-        help="Gesture travel ratio between 0.2 and 0.85",
-    )
+    scroll.add_argument("--distance-ratio", type=float, default=0.55, help="Gesture travel ratio between 0.2 and 0.85")
 
     subparsers.add_parser("back", help="Trigger Android global back action")
 
-    wait_for_stable_tree = subparsers.add_parser(
-        "wait-for-stable-tree",
-        help="Poll until the current screen fingerprint becomes stable",
-    )
+    wait_for_stable_tree = subparsers.add_parser("wait-for-stable-tree", help="Poll until the screen fingerprint becomes stable")
     wait_for_stable_tree.add_argument("--timeout-ms", type=int, default=10000)
     wait_for_stable_tree.add_argument("--poll-interval-ms", type=int, default=500)
     wait_for_stable_tree.add_argument("--stable-samples", type=int, default=2)
 
     screenshot = subparsers.add_parser("screenshot", help="Capture a screenshot")
-    screenshot.add_argument(
-        "--output",
-        type=Path,
-        default=Path("adhelper-screenshot.jpg"),
-        help="Write decoded image bytes to this file",
-    )
-
+    screenshot.add_argument("--output", type=Path, default=Path("adhelper-screenshot.jpg"), help="Write decoded image bytes to this file")
     return parser
+
+
+def build_client(args: argparse.Namespace) -> BaseHelperClient:
+    if args.server_url:
+        if not args.device_id or not args.token:
+            raise HelperClientError("--server-url requires --device-id and --token")
+        return ServerHelperClient(args.server_url, args.device_id, args.token)
+    return LocalHelperClient(serial=args.serial, port=args.port, auto_forward=not args.no_forward)
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -187,15 +210,14 @@ def print_json(payload: dict, pretty: bool) -> None:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    client = HelperClient(serial=args.serial, port=args.port, auto_forward=not args.no_forward)
 
     try:
-        client.ensure_forward()
+        client = build_client(args)
 
         if args.command_name == "health":
             response = client.health()
             print_json(response, args.pretty)
-            return 0 if response.get("ok") else 1
+            return 0 if response.get("ok", True) else 1
 
         if args.command_name == "current-app":
             response = client.command({"command": "current_app"})
@@ -212,12 +234,7 @@ def main() -> int:
             return 0 if response.get("ok") else 1
 
         if args.command_name == "snapshot":
-            response = client.command(
-                {
-                    "command": "snapshot",
-                    "includeScreenshot": args.include_screenshot,
-                }
-            )
+            response = client.command({"command": "snapshot", "includeScreenshot": args.include_screenshot})
             if args.output:
                 write_json(args.output, response)
                 print(f"Wrote snapshot JSON to {args.output}")
@@ -235,45 +252,22 @@ def main() -> int:
             return 0 if response.get("ok") else 1
 
         if args.command_name == "click-text":
-            response = client.command(
-                {
-                    "command": "click_text",
-                    "text": args.text,
-                    "exact": args.exact,
-                }
-            )
+            response = client.command({"command": "click_text", "text": args.text, "exact": args.exact})
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
         if args.command_name == "click-point":
-            response = client.command(
-                {
-                    "command": "click_point",
-                    "x": args.x,
-                    "y": args.y,
-                }
-            )
+            response = client.command({"command": "click_point", "x": args.x, "y": args.y})
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
         if args.command_name == "click-node":
-            response = client.command(
-                {
-                    "command": "click_node",
-                    "nodeId": args.node_id,
-                }
-            )
+            response = client.command({"command": "click_node", "nodeId": args.node_id})
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
         if args.command_name == "scroll":
-            response = client.command(
-                {
-                    "command": "scroll",
-                    "direction": args.direction,
-                    "distanceRatio": args.distance_ratio,
-                }
-            )
+            response = client.command({"command": "scroll", "direction": args.direction, "distanceRatio": args.distance_ratio})
             print_json(response, args.pretty)
             return 0 if response.get("ok") else 1
 
